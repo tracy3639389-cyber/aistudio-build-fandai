@@ -1,0 +1,6 @@
+{
+  "name": "Tracy Build",
+  "description": "✨ Tracy Build (build 1.7) - 双向心跳与断线重连通信中转客户端",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
