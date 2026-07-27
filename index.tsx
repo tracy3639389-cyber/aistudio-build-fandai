@@ -1,7 +1,7 @@
 
 /**
- * Tracy Build 1.7
- * 深度诊断、应用层主动心跳与断线重连版
+ * Tracy Build 2.3
+ * 初始多段自启重连、双向心跳、断线重连与防宿主睡眠保活版
  */
 
 // ==========================================
@@ -9,9 +9,13 @@
 // ==========================================
 const CONFIG = {
     wsUrl: 'ws://127.0.0.1:9998',
-    mode: 'fake', 
-    keepAlive: false 
+    mode: 'real', 
+    keepAlive: true,
+    heartbeat: true
 };
+
+const LOG_STORE_KEY = 'tracy_log_html_v2';
+const UNLOAD_STORE_KEY = 'tracy_last_unload_v2';
 
 // 状态码解析增强
 const ERROR_MAP: Record<number, string> = {
@@ -61,6 +65,7 @@ body {
 .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; padding: 0 4px; }
 .app-title { font-weight: 700; font-size: 18px; letter-spacing: 0.5px; display: flex; align-items: center; gap: 8px; }
 .version-tag { font-size: 10px; color: var(--primary); border: 1px solid var(--primary); padding: 1px 6px; border-radius: 4px; opacity: 0.8; }
+.update-date-tag { font-size: 10px; color: #fbbf24; border: 1px solid #a855f7; padding: 1px 6px; border-radius: 4px; opacity: 0.9; font-weight: 500; }
 
 .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
 
@@ -80,7 +85,7 @@ body {
 .ka-icon { width: 8px; height: 8px; border-radius: 2px; background: #333; }
 .ka-switch.active .ka-icon { background: var(--primary); }
 
-.action-btn { background: var(--primary); color: #fff; border: none; padding: 10px 16px; border-radius: 8px; font-weight: 600; cursor: pointer; flex-grow: 1; }
+.action-btn { background: var(--primary); color: #fff; border: none; padding: 6px 12px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; flex-shrink: 0; }
 .action-btn.stop { background: var(--red); }
 .action-btn:disabled { opacity: 0.5; }
 
@@ -106,13 +111,20 @@ body {
 // 2. 界面构建
 // ==========================================
 function createUI() {
+    const previousLogHtml =
+        (document.getElementById('log-box') as HTMLElement | null)?.innerHTML ||
+        sessionStorage.getItem(LOG_STORE_KEY) ||
+        '';
+
+    document.getElementById('tracy-style')?.remove();
     const style = document.createElement('style');
+    style.id = 'tracy-style';
     style.textContent = styles;
     document.head.appendChild(style);
 
     document.body.innerHTML = `
     <div class="header">
-        <div class="app-title">✨ Tracy <span class="version-tag">build 1.7</span></div>
+        <div class="app-title">✨ Tracy <span class="version-tag">build 2.3</span><span class="update-date-tag">更新日期：2026年06月22日</span></div>
         <div class="status-indicator">
             <div id="status-dot" class="dot"></div>
             <span id="status-text">离线</span>
@@ -121,12 +133,16 @@ function createUI() {
 
     <div class="card control-panel">
         <div class="mode-switch" id="mode-switch">
-            <div class="mode-opt active" data-val="fake">非流式</div>
-            <div class="mode-opt" data-val="real">流式</div>
+            <div class="mode-opt" data-val="fake">非流式</div>
+            <div class="mode-opt active" data-val="real">流式</div>
         </div>
-        <div class="ka-switch" id="ka-btn">
+        <div class="ka-switch active" id="ka-btn">
             <div class="ka-icon"></div>
             <span>后台保活</span>
+        </div>
+        <div class="ka-switch active" id="hb-btn">
+            <div class="ka-icon"></div>
+            <span>主动心跳</span>
         </div>
         <button id="main-btn" class="action-btn">启动服务</button>
     </div>
@@ -151,6 +167,12 @@ function createUI() {
         <button class="mini-btn" id="reset-stat">重置数据</button>
     </div>
     `;
+
+    const logBox = document.getElementById('log-box') as HTMLElement | null;
+    if (logBox && previousLogHtml) {
+        logBox.innerHTML = previousLogHtml;
+        logBox.scrollTop = logBox.scrollHeight;
+    }
 }
 
 // ==========================================
@@ -165,6 +187,9 @@ const Core: any = {
     heartbeatTimer: null,
     reconnectTimer: null,
     isManuallyStopped: false,
+    lastActiveTime: null,
+    lifecycleBound: false,
+    initialAttempts: 0,
     
     init() {
         createUI();
@@ -173,17 +198,24 @@ const Core: any = {
             logBox: document.getElementById('log-box'),
             statusDot: document.getElementById('status-dot'),
             statusText: document.getElementById('status-text'),
-            kaBtn: document.getElementById('ka-btn')
+            kaBtn: document.getElementById('ka-btn'),
+            hbBtn: document.getElementById('hb-btn')
         };
+
+        // 根据默认全局配置，同步按钮的激活样式
+        this.els.kaBtn.classList.toggle('active', CONFIG.keepAlive);
+        this.els.hbBtn.classList.toggle('active', CONFIG.heartbeat);
 
         this.els.btn.onclick = () => {
             if (this.reconnectTimer) {
                 this.isManuallyStopped = true;
                 this.clearReconnect();
                 this.cleanup();
+                this.initialAttempts = 0;
                 this.log('🔌 已手动取消自动重连', 'c-info');
                 return;
             }
+            this.initialAttempts = 0;
             this.socket ? this.stop() : this.start();
         };
         
@@ -201,15 +233,54 @@ const Core: any = {
             CONFIG.keepAlive = !CONFIG.keepAlive;
             this.els.kaBtn.classList.toggle('active', CONFIG.keepAlive);
             if (this.socket) CONFIG.keepAlive ? this.startKeepAlive() : this.stopKeepAlive();
+            this.log(`⚙️ 后台保活已${CONFIG.keepAlive ? '开启' : '关闭'}`, 'c-info');
         };
 
-        (document.getElementById('clean-log') as HTMLElement).onclick = () => this.els.logBox.innerHTML = '';
+        this.els.hbBtn.onclick = () => {
+            CONFIG.heartbeat = !CONFIG.heartbeat;
+            this.els.hbBtn.classList.toggle('active', CONFIG.heartbeat);
+            if (this.socket) {
+                CONFIG.heartbeat ? this.startHeartbeat() : this.stopHeartbeat();
+            }
+            this.log(`⚙️ 主动心跳已${CONFIG.heartbeat ? '开启' : '关闭'}`, 'c-info');
+        };
+
+        (document.getElementById('clean-log') as HTMLElement).onclick = () => {
+            this.els.logBox.innerHTML = '';
+            sessionStorage.removeItem(LOG_STORE_KEY);
+        };
         (document.getElementById('reset-stat') as HTMLElement).onclick = () => {
             this.stats = { calls: 0, totalTokens: 0 };
             this.updateStats({ prompt: 0, candidates: 0, total: 0 });
         };
 
         this.initAudio();
+        this.bindLifecycle();
+        // 初始自动启动 (初次加载或刷新页面后)
+        this.triggerInitialAutoStart();
+    },
+
+    bindLifecycle() {
+        if (this.lifecycleBound) return;
+        this.lifecycleBound = true;
+
+        const lastUnload = sessionStorage.getItem(UNLOAD_STORE_KEY);
+        if (lastUnload) {
+            this.log(`🔄 检测到页面/脚本曾重新加载，上次卸载时间: ${lastUnload}`, 'c-info');
+            sessionStorage.removeItem(UNLOAD_STORE_KEY);
+        }
+
+        window.addEventListener('beforeunload', () => {
+            this.persistLog();
+            sessionStorage.setItem(
+                UNLOAD_STORE_KEY,
+                new Date().toLocaleString('zh-CN', { hour12: false })
+            );
+        });
+
+        document.addEventListener('visibilitychange', () => {
+            this.log(`👁️ 页面可见性变更: ${document.visibilityState}`, 'c-info');
+        });
     },
 
     initAudio() {
@@ -238,19 +309,22 @@ const Core: any = {
                 this.log('✅ 通信链路已打通，监听请求中...', 'c-success');
                 this.startTimer();
                 this.startHeartbeat();
+                this.initialAttempts = 0; // 连接成功建立，重置初始自启计数器
             };
-            this.socket.onclose = () => {
+            this.socket.onclose = (ev: CloseEvent) => {
+                const reason = ev.reason ? ` reason=${ev.reason}` : '';
                 this.cleanup();
-                this.log('🔌 通信链路已断开', 'c-error');
+                this.log(`🔌 通信链路已断开 code=${ev.code} clean=${ev.wasClean}${reason}`, 'c-error');
                 if (!this.isManuallyStopped) {
-                    this.reconnect();
+                    this.handleDisconnectOrFailure();
                 }
             };
             this.socket.onerror = () => {
-                this.log('⚠️ 连接错误，请确保中转服务器正在运行', 'c-error');
+                const readyState = this.socket ? this.socket.readyState : 'unknown';
+                this.log(`⚠️ 连接错误，请确保中转服务器正在运行 readyState=${readyState}`, 'c-error');
                 this.cleanup();
                 if (!this.isManuallyStopped) {
-                    this.reconnect();
+                    this.handleDisconnectOrFailure();
                 }
             };
             this.socket.onmessage = (e: any) => this.handleRequest(e.data);
@@ -259,6 +333,7 @@ const Core: any = {
 
     stop() {
         this.isManuallyStopped = true;
+        this.initialAttempts = 0;
         this.clearReconnect();
         if (this.socket) {
             this.socket.close();
@@ -295,16 +370,55 @@ const Core: any = {
 
     startHeartbeat() {
         this.stopHeartbeat();
+        if (!CONFIG.heartbeat) return;
         this.heartbeatTimer = setInterval(() => {
             console.debug('💓 发送应用层心跳信号');
             this.send({ event_type: 'heartbeat' });
-        }, 25000);
+        }, 60000);
     },
 
     stopHeartbeat() {
         if (this.heartbeatTimer) {
             clearInterval(this.heartbeatTimer);
             this.heartbeatTimer = null;
+        }
+    },
+
+    triggerInitialAutoStart() {
+        this.initialAttempts = 1;
+        this.log('🚀 页面加载/刷新完成，触发首次自动建立连接 (第 1/4 次自启)...', 'c-info');
+        this.start();
+    },
+
+    handleDisconnectOrFailure() {
+        if (this.isManuallyStopped) return;
+
+        // 初始自启重连逻辑：只在前 3 次重试期间 (第 1、2、3 次失败之后)
+        if (this.initialAttempts > 0 && this.initialAttempts < 4) {
+            let delay = 10000;
+            if (this.initialAttempts === 1) delay = 10000; // 第 2 次自启间隔为 10 秒
+            else if (this.initialAttempts === 2) delay = 15000; // 第 3 次自启间隔为 15 秒
+            else if (this.initialAttempts === 3) delay = 30000; // 第 4 次自启间隔为 30 秒
+
+            const nextAttempt = this.initialAttempts + 1;
+            this.initialAttempts = nextAttempt;
+
+            this.setStatus('reconnecting');
+            this.log(`⏳ 初始自启链路未疏通，将在 ${delay / 1000} 秒后触发下一次自启 (第 ${nextAttempt}/4 次)...`, 'c-info');
+
+            this.reconnectTimer = setTimeout(() => {
+                this.reconnectTimer = null;
+                if (!this.socket && !this.isManuallyStopped) {
+                    this.start();
+                }
+            }, delay);
+        } else {
+            // 正常工作的断线，或者 4 次初始自启额度已经全部用完，则回归常规断流重连
+            if (this.initialAttempts >= 4) {
+                this.log('⚠️ 4次初始自动连接重试已试满，连接依然未打通。此后退回常规 4 秒重试机制。', 'c-info');
+                this.initialAttempts = 0;
+            }
+            this.reconnect();
         }
     },
 
@@ -331,6 +445,7 @@ const Core: any = {
     },
 
     async handleRequest(rawMsg: string) {
+        this.lastActiveTime = Date.now(); // 收到任何消息（包括心跳信号），更新最后活体时间
         let req;
         try {
             req = JSON.parse(rawMsg);
@@ -489,6 +604,12 @@ const Core: any = {
 
     send(msg: any) { if (this.socket && this.socket.readyState === 1) this.socket.send(JSON.stringify(msg)); },
 
+    persistLog() {
+        if (this.els?.logBox) {
+            sessionStorage.setItem(LOG_STORE_KEY, this.els.logBox.innerHTML);
+        }
+    },
+
     log(msg: string, cls: string) {
         const div = document.createElement('div');
         div.className = `log-entry ${cls || ''}`;
@@ -497,6 +618,7 @@ const Core: any = {
         this.els.logBox.appendChild(div);
         this.els.logBox.scrollTop = this.els.logBox.scrollHeight;
         if (this.els.logBox.childElementCount > 150) this.els.logBox.removeChild(this.els.logBox.firstChild);
+        this.persistLog();
     },
 
     updateStats(u: any) {
@@ -510,11 +632,21 @@ const Core: any = {
     startTimer() {
         if(this.timer) return;
         this.startTime = Date.now();
+        this.lastActiveTime = Date.now(); // 重启定时器时初始化活跃基准时间
         this.timer = setInterval(() => {
             const diff = Math.floor((Date.now() - this.startTime) / 1000);
             const m = Math.floor(diff / 60).toString().padStart(2, '0');
             const s = (diff % 60).toString().padStart(2, '0');
             document.getElementById('v-time')!.innerText = `${m}:${s}`;
+
+            // 僵尸连接检测 (1500 秒无数据交互自动重连)
+            if (this.socket && this.socket.readyState === 1) {
+                const idleTime = Date.now() - this.lastActiveTime;
+                if (idleTime > 1500000) { 
+                    this.log('⚠️ 底层物理链路遭遇静默中断或断流 (1500秒无心跳)，自动断开重建中...', 'c-error');
+                    this.socket.close(); // 这将自动触发 onclose 以进入 reconnect 阶段
+                }
+            }
         }, 1000);
     },
     
